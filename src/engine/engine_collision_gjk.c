@@ -14,6 +14,7 @@
 
 #include "engine/engine_collision_gjk.h"
 
+#include <math.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -1229,13 +1230,20 @@ static inline int insertVertex(Polytope* pt, const Vertex* v) {
 }
 
 
-// delete face from map (return non-zero on error)
-static void deleteFace(Polytope* pt, Face* face) {
+// remove a closest-face candidate without deleting it from the polytope
+static void removeFaceCandidate(Polytope* pt, Face* face) {
   if (face->index >= 0) {
     pt->map[face->index] = pt->map[--pt->nmap];
     pt->map[face->index]->index = face->index;
   }
-  face->index = -2;  // mark face as deleted from map and polytope
+  face->index = -1;
+}
+
+
+// delete face from map and polytope
+static void deleteFace(Polytope* pt, Face* face) {
+  removeFaceCandidate(pt, face);
+  face->index = -2;
 }
 
 
@@ -1343,21 +1351,75 @@ static int horizon(Polytope* pt, Face* face) {
 }
 
 
+// coordinates of the projection in a face, computed relative to its first vertex
+static void epaFaceCoord(double lambda[3], const Polytope* pt, const Face* face) {
+  int verts[3] = EPA_VERT_EXPAND(face->verts);
+  double v[3][3], e1[3], e2[3], p[3], n[3];
+  // Retain the difference of the original support points in single-precision
+  // builds too. Rounding these differences before interpolation can introduce
+  // tangential errors much larger than a shallow contact's depth.
+  for (int i = 0; i < 3; i++) {
+    const Vertex* vertex = pt->verts + verts[i];
+    for (int j = 0; j < 3; j++) {
+      v[i][j] = (double)vertex->vert1[j] - (double)vertex->vert2[j];
+    }
+  }
+  for (int j = 0; j < 3; j++) {
+    e1[j] = v[1][j] - v[0][j];
+    e2[j] = v[2][j] - v[0][j];
+    p[j] = (double)face->v[j] - v[0][j];
+  }
+  n[0] = e1[1]*e2[2] - e1[2]*e2[1];
+  n[1] = e1[2]*e2[0] - e1[0]*e2[2];
+  n[2] = e1[0]*e2[1] - e1[1]*e2[0];
+  int axis = 0;
+  for (int i = 1; i < 3; i++) {
+    if (fabs(n[i]) > fabs(n[axis])) axis = i;
+  }
+  if (n[axis] == 0) {
+    lambda[0] = lambda[1] = lambda[2] = -1;
+    return;
+  }
+  int x = (axis + 1) % 3, y = (axis + 2) % 3;
+  lambda[1] = (p[x]*e2[y] - p[y]*e2[x]) / n[axis];
+  lambda[2] = (e1[x]*p[y] - e1[y]*p[x]) / n[axis];
+  lambda[0] = 1 - lambda[1] - lambda[2];
+  // A projection on a shared edge can acquire a small negative weight from
+  // rounding the face normal. Keep that boundary candidate, but never use a
+  // negative interpolation weight for its witnesses.
+  double roundoff = 32 * (sizeof(mjtNum) == sizeof(float) ? FLT_EPSILON : DBL_EPSILON);
+  if (lambda[0] >= -roundoff && lambda[1] >= -roundoff && lambda[2] >= -roundoff &&
+      (lambda[0] < 0 || lambda[1] < 0 || lambda[2] < 0)) {
+    for (int i = 0; i < 3; i++) {
+      if (lambda[i] < 0) lambda[i] = 0;
+    }
+    double sum = lambda[0] + lambda[1] + lambda[2];
+    for (int i = 0; i < 3; i++) lambda[i] /= sum;
+  }
+}
+
+
+// add a closest-face candidate; validate its projection only when selected
+static void epaMapFace(Polytope* pt, Face* face) {
+  face->index = pt->nmap;
+  pt->map[pt->nmap++] = face;
+}
+
+
 // recover witness points from EPA polytope, return signed distance between witness points
-static mjtNum epaWitness(const Polytope* pt, const Face* face, mjtNum x1[3], mjtNum x2[3]) {
-  // compute affine coordinates for witness points on plane defined by face
-  mjtNum lambda[3];
+static mjtNum epaWitness(const Polytope* pt, const Face* face, const double lambda[3],
+                         mjtNum x1[3], mjtNum x2[3]) {
   int verts[3] = EPA_VERT_EXPAND(face->verts);
   Vertex* v1 = pt->verts + verts[0];
   Vertex* v2 = pt->verts + verts[1];
   Vertex* v3 = pt->verts + verts[2];
-  triAffineCoord(lambda, v1->vert, v2->vert, v3->vert, face->v);
 
-  // witness point on geom 1
-  lincomb(x1, lambda, 3, v1->vert1, v2->vert1, v3->vert1, NULL);
-
-  // witness point on geom 2
-  lincomb(x2, lambda, 3, v1->vert2, v2->vert2, v3->vert2, NULL);
+  // Use the same convex weights for both witnesses, without rounding the
+  // weights or intermediate sums to mjtNum before forming each point.
+  for (int i = 0; i < 3; i++) {
+    x1[i] = lambda[0]*v1->vert1[i] + lambda[1]*v2->vert1[i] + lambda[2]*v3->vert1[i];
+    x2[i] = lambda[0]*v1->vert2[i] + lambda[1]*v2->vert2[i] + lambda[2]*v3->vert2[i];
+  }
 
   return -mju_sqrt(face->dist2);
 }
@@ -1366,10 +1428,9 @@ static mjtNum epaWitness(const Polytope* pt, const Face* face, mjtNum x1[3], mjt
 // return a face of the expanded polytope that best approximates the pentration depth
 // witness points are in status->{x1, x2}
 static Face* epa(mjCCDStatus* status, Polytope* pt, mjCCDObj* obj1, mjCCDObj* obj2) {
-  mjtNum upper = mjMAX_LIMIT, upper2 = mjMAX_LIMIT, lower2;
-  Face* face = NULL, *pface = NULL;  // face closest to origin
-  Face* upper_face = NULL;           // face giving the upper bound
-  int bounded = 0;                   // depth is the upper bound
+  mjtNum lower2;
+  double lambda[3];  // convex weights of the selected face's projection
+  Face* face = NULL;  // face closest to origin
   int discrete = discreteGeom(obj1) && discreteGeom(obj2);
 
   // discrete geoms return in a finite number of iterations, a non-zero tolerance avoids
@@ -1378,27 +1439,37 @@ static Face* epa(mjCCDStatus* status, Polytope* pt, mjCCDObj* obj1, mjCCDObj* ob
 
   int k, kmax = status->max_iterations < 1000 ? status->max_iterations : 1000;
   for (k = 0; k < kmax; k++) {
-    pface = face;
-
-    // find the face closest to the origin (lower bound for penetration depth)
-    lower2 = mjMAX_LIMIT;
-    for (int i = 0; i < pt->nmap; i++) {
-      if (pt->map[i]->dist2 < lower2) {
-        face = pt->map[i];
-        lower2 = face->dist2;
+    // Find the closest face containing its projection. Most new faces will be
+    // deleted by a later expansion without ever needing this coordinate check.
+    for (;;) {
+      face = NULL;
+      lower2 = mjMAX_LIMIT;
+      for (int i = 0; i < pt->nmap; i++) {
+        if (pt->map[i]->dist2 < lower2) {
+          face = pt->map[i];
+          lower2 = face->dist2;
+        }
       }
+      if (!face) break;
+
+      epaFaceCoord(lambda, pt, face);
+      if (lambda[0] >= 0 && lambda[1] >= 0 && lambda[2] >= 0) break;
+
+      // Coplanar triangles have the same plane distance, but extrapolating
+      // outside one can put witnesses outside their geoms. Keep it available
+      // for horizon traversal; it cannot be the closest-face candidate.
+      removeFaceCandidate(pt, face);
     }
 
-    // face not valid, return face giving the upper bound
-    if (lower2 > upper2 || !face) {
-      face = upper_face ? upper_face : pface;
-      bounded = upper_face != NULL;
+    // no face candidates left
+    if (!face) {
       break;
     }
 
     // check if lower bound is 0
     if (lower2 <= 0) {
       mju_warning("EPA: origin lies on affine hull of face");
+      face = NULL;
       break;
     }
 
@@ -1406,21 +1477,14 @@ static Face* epa(mjCCDStatus* status, Polytope* pt, mjCCDObj* obj1, mjCCDObj* ob
     mjtNum lower = mju_sqrt(lower2);
     int wi = epaSupport(pt, obj1, obj2, face->v, lower);
     const Vertex* w = pt->verts + wi;
-    mjtNum upper_k = dot3(face->v, w->vert) / lower;  // upper bound for kth iteration
-    if (upper_k < upper) {
-      upper = upper_k;
-      upper2 = upper * upper;
-      upper_face = face;
-    }
-    if (upper - lower < tolerance) {
+    // Converge on this face: an upper bound from a different normal only bounds
+    // the depth, not the accuracy of this face or its witness points.
+    mjtNum upper = dot3(face->v, w->vert) / lower;
+    if (upper - lower <= tolerance) {
       // terminate without contact when upper < lower on first iteration
       if (k == 0 && upper < lower - 1e-10) {
         face = NULL;
         status->epa_status = mjEPA_NOCONTACT;
-      } else if (upper_face != face) {
-        // upper bound from an earlier face, return that face
-        face = upper_face;
-        bounded = 1;
       }
       break;
     }
@@ -1478,12 +1542,8 @@ static Face* epa(mjCCDStatus* status, Polytope* pt, mjCCDObj* obj1, mjCCDObj* ob
       break;
     }
 
-    // store face in map
-    if (dist2 >= lower2 && dist2 <= upper2) {
-      int i = pt->nmap++;
-      pt->map[i] = &pt->faces[pt->nfaces - 1];
-      pt->map[i]->index = i;
-    }
+    // Do not prune by another face's bounds: this face must converge locally.
+    epaMapFace(pt, &pt->faces[pt->nfaces - 1]);
 
     // attach remaining faces
     for (int i = 1; i < nedges; i++) {
@@ -1505,11 +1565,7 @@ static Face* epa(mjCCDStatus* status, Polytope* pt, mjCCDObj* obj1, mjCCDObj* ob
       }
 
       // store face in map
-      if (dist2 >= lower2 && dist2 <= upper2) {
-        int idx = pt->nmap++;
-        pt->map[idx] = &pt->faces[pt->nfaces - 1];
-        pt->map[idx]->index = idx;
-      }
+      epaMapFace(pt, &pt->faces[pt->nfaces - 1]);
     }
     pt->horizon.nedges = 0;  // clear horizon
 
@@ -1521,15 +1577,7 @@ static Face* epa(mjCCDStatus* status, Polytope* pt, mjCCDObj* obj1, mjCCDObj* ob
 
   status->epa_iterations = k;
   if (face) {
-    status->dist[0] = epaWitness(pt, face, status->x1, status->x2);
-
-    // separate witness points to the upper bound
-    if (bounded) {
-      mjtNum s = 0.5 * (upper + status->dist[0]) / -status->dist[0];
-      addScl3(status->x1, status->x1, face->v, s);
-      addScl3(status->x2, status->x2, face->v, -s);
-      status->dist[0] = -upper;
-    }
+    status->dist[0] = epaWitness(pt, face, lambda, status->x1, status->x2);
     status->nx = 1;
   } else {
     status->nx = 0;

@@ -17,6 +17,7 @@
 #include "src/engine/engine_collision_gjk.h"
 
 #include <cstddef>
+#include <limits>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -88,7 +89,8 @@ mjtNum GeomDist(const MjModelPtr& m, const MjDataPtr& d, int g1, int g2,
 int Penetration(mjCCDStatus& status, mjtNum& depth, std::vector<mjtNum>& dir,
                 std::vector<mjtNum>& pos, const MjModelPtr& model,
                 const MjDataPtr& data, int g1, int g2, mjtNum margin = 0,
-                int max_contacts = 1) {
+                int max_contacts = 1, int max_iterations = kMaxIterations,
+                mjtNum tolerance = kTolerance) {
   mjCCDObj obj1, obj2;
   mjc_initCCDObj(&obj1, model.get(), data.get(), g1, margin);
   mjc_initCCDObj(&obj2, model.get(), data.get(), g2, margin);
@@ -97,9 +99,9 @@ int Penetration(mjCCDStatus& status, mjtNum& depth, std::vector<mjtNum>& dir,
   if (max_contacts == 1) {
     ccd_t ccd;
     CCD_INIT(&ccd);
-    ccd.mpr_tolerance = kTolerance;
-    ccd.epa_tolerance = kTolerance;
-    ccd.max_iterations = kMaxIterations;
+    ccd.mpr_tolerance = tolerance;
+    ccd.epa_tolerance = tolerance;
+    ccd.max_iterations = max_iterations;
     ccd.center1 = mjccd_center;
     ccd.center2 = mjccd_center;
     ccd.support1 = mjccd_support;
@@ -124,14 +126,13 @@ int Penetration(mjCCDStatus& status, mjtNum& depth, std::vector<mjtNum>& dir,
 
   // set config
   auto buffer = std::vector<std::byte>(
-      mjc_ccdSize(model->npolygonmax, model->nmeshdegmax, kMaxIterations));
-  config.max_iterations = kMaxIterations;
-  config.tolerance = kTolerance;
+      mjc_ccdSize(model->npolygonmax, model->nmeshdegmax, max_iterations));
+  config.max_iterations = max_iterations;
+  config.tolerance = tolerance;
   config.max_contacts = max_contacts;
   config.dist_cutoff = 0;  // no geom distances needed
   config.npolygonmax = model->npolygonmax;
   config.nmeshdegmax = model->nmeshdegmax;
-  config.max_contacts = max_contacts;
   config.buffer = buffer.data();
 
   mjtNum dist = mjc_ccd(&config, &status, &obj1, &obj2);
@@ -2608,5 +2609,106 @@ TEST_F(MjGjkTest, EpaCylinderThinBoxNormal) {
   EXPECT_LT(dir[2], -0.999);
   EXPECT_NEAR(dist, -1.2611e-4, kTolerance);
 }
+#if !defined(TEST_WITH_LIBCCD)
+// These regressions inspect MuJoCo's native EPA witnesses and iteration count.
+TEST_F(MjGjkTest, EpaWitnessesStayInGeoms) {
+  // The first case must not stretch an old face's witnesses to a historical
+  // upper bound. The second must not extrapolate outside a coplanar triangle.
+  constexpr char xml1[] = R"(
+  <mujoco><worldbody>
+    <geom type="box" size=".015 .015 .0025"/>
+    <geom type="cylinder" size=".006 .08"
+          pos="0.053156855226554917 0.019274486345628845 0.0086039112631109676"
+          quat="0.71194328461072864 -0.31549613565934675 0.62737464714611002 0"/>
+  </worldbody></mujoco>)";
+  constexpr char xml2[] = R"(
+  <mujoco><worldbody>
+    <geom type="box" size=".008 .021 .013"/>
+    <geom type="cylinder" size=".008 .021"
+          pos="-0.0034539941058981993 0.023408299878988021 0.020563651305639064"/>
+  </worldbody></mujoco>)";
+
+  for (const char* xml : {xml1, xml2}) {
+    for (mjtNum scale : {mjtNum(0.01), mjtNum(1), mjtNum(100)}) {
+      SCOPED_TRACE(scale);
+      MjModelPtr model = LoadModelFromString(xml);
+      ASSERT_NE(model, nullptr);
+      MjDataPtr data = MakeData(model);
+      mj_forward(model.get(), data.get());
+      for (int i = 0; i < 6; i++) {
+        model->geom_size[i] *= scale;
+        data->geom_xpos[i] *= scale;
+      }
+      mjtNum tolerance = kTolerance * scale;
+      for (int swap : {0, 1}) {
+        SCOPED_TRACE(swap);
+        mjCCDStatus status;
+        std::vector<mjtNum> dir, pos;
+        mjtNum dist;
+        ASSERT_EQ(Penetration(status, dist, dir, pos, model, data, swap, 1 - swap,
+                              0, 1, kMaxIterations, tolerance), 1);
+        EXPECT_EQ(status.epa_status, mjEPA_SUCCESS);
+        for (int j = 0; j < 2; j++) {
+          int g = j ? 1 - swap : swap;
+          const mjtNum* point = j ? status.x2 : status.x1;
+          mjtNum offset[3], local[3];
+          mju_sub3(offset, point, data->geom_xpos + 3*g);
+          mju_mulMatTVec3(local, data->geom_xmat + 9*g, offset);
+          const mjtNum* size = model->geom_size + 3*g;
+          if (model->geom_type[g] == mjGEOM_BOX) {
+            for (int axis = 0; axis < 3; axis++) {
+              EXPECT_LE(mju_abs(local[axis]), size[axis] + tolerance);
+            }
+          } else {
+            EXPECT_LE(mju_sqrt(local[0]*local[0] + local[1]*local[1]),
+                      size[0] + tolerance);
+            EXPECT_LE(mju_abs(local[2]), size[1] + tolerance);
+          }
+        }
+
+        // Check the local support gap, not only the scalar depth.
+        mjCCDObj obj1, obj2;
+        mjc_initCCDObj(&obj1, model.get(), data.get(), swap, 0);
+        mjc_initCCDObj(&obj2, model.get(), data.get(), 1 - swap, 0);
+        mjtNum neg[3], support1[3], support2[3], delta[3];
+        mju_scl3(neg, dir.data(), -1);
+        obj1.support(support1, &obj1, dir.data());
+        obj2.support(support2, &obj2, neg);
+        mju_sub3(delta, support1, support2);
+        mjtNum roundoff = 32 * std::numeric_limits<mjtNum>::epsilon() * scale;
+        EXPECT_LE(mju_dot3(delta, dir.data()) + dist, tolerance + roundoff);
+      }
+    }
+  }
+}
+
+TEST_F(MjGjkTest, EpaIterationLimitKeepsFeasibleWitnesses) {
+  constexpr char xml[] = R"(
+  <mujoco><worldbody>
+    <geom type="ellipsoid" size="1 1 1"/>
+    <geom type="ellipsoid" size="1 1 1" pos=".1 .2 .3"/>
+  </worldbody></mujoco>)";
+  MjModelPtr model = LoadModelFromString(xml);
+  ASSERT_NE(model, nullptr);
+  MjDataPtr data = MakeData(model);
+  mj_forward(model.get(), data.get());
+  bool limited = false;
+  for (int iterations : {4, 8, 16}) {
+    SCOPED_TRACE(iterations);
+    mjCCDStatus status;
+    std::vector<mjtNum> dir, pos;
+    mjtNum dist;
+    int n = Penetration(status, dist, dir, pos, model, data, 0, 1, 0, 1, iterations);
+    limited |= status.epa_iterations == iterations;
+    ASSERT_EQ(n, 1);
+    for (int g = 0; g < 2; g++) {
+      mjtNum offset[3];
+      mju_sub3(offset, g ? status.x2 : status.x1, data->geom_xpos + 3*g);
+      EXPECT_LE(mju_norm3(offset), 1 + kTolerance);
+    }
+  }
+  EXPECT_TRUE(limited);
+}
+#endif  // !defined(TEST_WITH_LIBCCD)
 
 }  // namespace mujoco
