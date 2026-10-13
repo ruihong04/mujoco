@@ -2574,4 +2574,82 @@ TEST_F(MjGjkTest, MultiCCDEdgeClipEmpty) {
   EXPECT_MJTNUM_EQ(dir1[2], dir2[2]);
 }
 
+TEST_F(MjGjkTest, CapsuleMeshMultiCCDEdgeSideFace) {
+  static constexpr char xml[] = R"(
+  <mujoco>
+    <asset>
+      <mesh name="slab"
+            vertex="-0.03 -0.02 -0.005   0.03 -0.02 -0.005  -0.03  0.02 -0.005   0.03  0.02 -0.005
+                    -0.03 -0.02  0       0.03 -0.02  0      -0.03  0.02  0       0.03  0.02  0"/>
+    </asset>
+    <worldbody>
+      <geom name="slab" type="mesh" mesh="slab"/>
+      <geom name="capsule" type="capsule" size="0.005"
+            fromto="0.03 -0.0297 0.01127  0.03 0.0297 0.00293"/>
+    </worldbody>
+  </mujoco>)";
+
+  MjModelPtr model = LoadModelFromString(xml);
+  MjDataPtr data = MakeData(model);
+  mj_forward(model.get(), data.get());
+
+  int g1 = mj_name2id(model.get(), mjOBJ_GEOM, "capsule");
+  int g2 = mj_name2id(model.get(), mjOBJ_GEOM, "slab");
+
+  mjCCDStatus status1, status2;
+  std::vector<mjtNum> dir1, pos1, dir2, pos2;
+  mjtNum dist1, dist2;
+  int ncons1 = Penetration(status1, dist1, dir1, pos1, model, data, g1, g2);
+  ASSERT_EQ(ncons1, 1);
+  EXPECT_NEAR(dist1, -7.4977e-4, kTolerance);
+  EXPECT_NEAR(dir1[1], -0.13904, 1e-5);
+  EXPECT_NEAR(dir1[2], -0.99029, 1e-5);
+
+  int ncons2 =
+      Penetration(status2, dist2, dir2, pos2, model, data, g1, g2, 0, 4);
+  ASSERT_GE(ncons2, 1);
+  EXPECT_NEAR(dist2, dist1, kTolerance);
+  for (int i = 0; i < ncons2; i++) {
+    EXPECT_GT(mju_dot3(&dir2[3*i], dir1.data()), mjFACE_TOL);
+  }
+}
+
+TEST_F(MjGjkTest, BoxMeshMultiCCDFacesNotFacingNormal) {
+  static constexpr char xml[] = R"(
+  <mujoco>
+    <asset>
+      <mesh name="plate"
+            vertex="-0.03 -0.02 -0.0025   0.03 -0.02 -0.0025  -0.03  0.02 -0.0025
+                     0.03  0.02 -0.0025  -0.03 -0.02  0.0025   0.03 -0.02  0.0025
+                    -0.03  0.02  0.0025   0.03  0.02  0.0025"/>
+    </asset>
+    <worldbody>
+      <geom name="plate" type="mesh" mesh="plate"/>
+      <geom name="box" type="box" size="0.003 0.002 0.003" pos="-0.002329 -0.02292 0.003841"
+            quat="-0.6737 -0.6638 -0.2035 0.253"/>
+    </worldbody>
+  </mujoco>)";
+
+  MjModelPtr model = LoadModelFromString(xml);
+  MjDataPtr data = MakeData(model);
+  mj_forward(model.get(), data.get());
+
+  int g1 = mj_name2id(model.get(), mjOBJ_GEOM, "box");
+  int g2 = mj_name2id(model.get(), mjOBJ_GEOM, "plate");
+
+  mjCCDStatus status1, status2;
+  std::vector<mjtNum> dir1, pos1, dir2, pos2;
+  mjtNum dist1, dist2;
+  int ncons1 = Penetration(status1, dist1, dir1, pos1, model, data, g1, g2);
+  ASSERT_EQ(ncons1, 1);
+
+  int ncons2 =
+      Penetration(status2, dist2, dir2, pos2, model, data, g1, g2, 0, 4);
+  ASSERT_GE(ncons2, 1);
+  EXPECT_NEAR(dist2, dist1, kTolerance);
+  for (int i = 0; i < ncons2; i++) {
+    EXPECT_GT(mju_dot3(&dir2[3*i], dir1.data()), 0.999);
+  }
+}
+
 }  // namespace mujoco

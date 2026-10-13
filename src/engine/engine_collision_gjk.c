@@ -2146,13 +2146,21 @@ static int meshFace(mjtNum* res, mjCCDObj* obj, int idx) {
 }
 
 
-// find two normals that are facing each other within a tolerance, return 1 if found
+// find two normals that are facing each other and the contact direction, return 1 if found
 static inline int alignedFaces(int res[2], const mjtNum* v, int nv,
-                               const mjtNum* w, int nw) {
+                               const mjtNum* w, int nw, const mjtNum dir[3]) {
   int found = 0;
   mjtNum best = -mjFACE_TOL;
   for (int i = 0; i < nv; i++) {
+    // ignore faces not facing -dir
+    if (-dot3(v + 3*i, dir) < mjFACE_TOL) {
+      continue;
+    }
     for (int j = 0; j < nw; j++) {
+      // ignore faces not facing dir
+      if (dot3(w + 3*j, dir) < mjFACE_TOL) {
+        continue;
+      }
       mjtNum tmp = dot3(v + 3*i, w + 3*j);
       if (tmp < best) {
         best = tmp;
@@ -2170,8 +2178,8 @@ static inline int alignedFaces(int res[2], const mjtNum* v, int nv,
 static inline int alignedFaceEdge(int res[2], const mjtNum* edge, int nedge,
                                   const mjtNum* face, int nface, const mjtNum dir[3]) {
   for (int i = 0; i < nface; i++) {
-    // ignore faces pointing away from the collision direction (negative dot product)
-    if (dot3(face + 3*i, dir) <= mjMINVAL) {
+    // ignore faces not facing the collision direction
+    if (dot3(face + 3*i, dir) < mjFACE_TOL) {
       continue;
     }
 
@@ -2250,7 +2258,10 @@ static void multicontact(int nmeshdegmax, int npolygonmax, uint8_t* buffer, cons
 
   mjtNum dir[3], dir_neg[3];
   sub3(dir, status->x2, status->x1);
-  sub3(dir_neg, status->x1, status->x2);
+  if (mju_normalize3(dir) < mjMINVAL) {
+    return;
+  }
+  scl3(dir_neg, dir, -1);
 
   // get all possible face normals for each geom
   if (obj1->geom_type == mjGEOM_BOX) {
@@ -2270,7 +2281,7 @@ static void multicontact(int nmeshdegmax, int npolygonmax, uint8_t* buffer, cons
 
   // determine if any two face normals match
   int res[2], edgecon1 = 0, edgecon2 = 0;
-  if (!alignedFaces(res, n1, nnorms1, n2, nnorms2)) {
+  if (!alignedFaces(res, n1, nnorms1, n2, nnorms2, dir)) {
     // check if edge-face collision
     if (nface1 < 3 && nnorms2 && (nface1 <= nface2 || !nnorms1)) {
       nnorms1 = 0;
