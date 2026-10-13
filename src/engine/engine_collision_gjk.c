@@ -1368,6 +1368,8 @@ static mjtNum epaWitness(const Polytope* pt, const Face* face, mjtNum x1[3], mjt
 static Face* epa(mjCCDStatus* status, Polytope* pt, mjCCDObj* obj1, mjCCDObj* obj2) {
   mjtNum upper = mjMAX_LIMIT, upper2 = mjMAX_LIMIT, lower2;
   Face* face = NULL, *pface = NULL;  // face closest to origin
+  Face* upper_face = NULL;           // face giving the upper bound
+  int bounded = 0;                   // depth is the upper bound
   int discrete = discreteGeom(obj1) && discreteGeom(obj2);
 
   // discrete geoms return in a finite number of iterations, a non-zero tolerance avoids
@@ -1387,9 +1389,10 @@ static Face* epa(mjCCDStatus* status, Polytope* pt, mjCCDObj* obj1, mjCCDObj* ob
       }
     }
 
-    // face not valid, return previous face
+    // face not valid, return face giving the upper bound
     if (lower2 > upper2 || !face) {
-      face = pface;
+      face = upper_face ? upper_face : pface;
+      bounded = upper_face != NULL;
       break;
     }
 
@@ -1407,12 +1410,17 @@ static Face* epa(mjCCDStatus* status, Polytope* pt, mjCCDObj* obj1, mjCCDObj* ob
     if (upper_k < upper) {
       upper = upper_k;
       upper2 = upper * upper;
+      upper_face = face;
     }
     if (upper - lower < tolerance) {
       // terminate without contact when upper < lower on first iteration
       if (k == 0 && upper < lower - 1e-10) {
         face = NULL;
         status->epa_status = mjEPA_NOCONTACT;
+      } else if (upper_face != face) {
+        // upper bound from an earlier face, return that face
+        face = upper_face;
+        bounded = 1;
       }
       break;
     }
@@ -1514,6 +1522,14 @@ static Face* epa(mjCCDStatus* status, Polytope* pt, mjCCDObj* obj1, mjCCDObj* ob
   status->epa_iterations = k;
   if (face) {
     status->dist[0] = epaWitness(pt, face, status->x1, status->x2);
+
+    // separate witness points to the upper bound
+    if (bounded) {
+      mjtNum s = 0.5 * (upper + status->dist[0]) / -status->dist[0];
+      addScl3(status->x1, status->x1, face->v, s);
+      addScl3(status->x2, status->x2, face->v, -s);
+      status->dist[0] = -upper;
+    }
     status->nx = 1;
   } else {
     status->nx = 0;

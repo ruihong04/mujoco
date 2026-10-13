@@ -2224,15 +2224,23 @@ TEST_F(MjGjkTest, CylinderBoxBackFaceEdge) {
   int g2 = mj_name2id(model.get(), mjOBJ_GEOM, "geom2");
 
   mjCCDStatus status1, status2;
-  std::vector<mjtNum> dir, pos;
-  mjtNum dist;
-  int ncons = Penetration(status1, dist, dir, pos, model, data, g1, g2, 0, 4);
-  ASSERT_EQ(ncons, 1);
+  std::vector<mjtNum> dir1, pos1, dir2, pos2;
+  mjtNum dist1, dist2;
+  int ncons1 = Penetration(status1, dist1, dir1, pos1, model, data, g1, g2);
+  ASSERT_EQ(ncons1, 1);
 
-  ncons = Penetration(status2, dist, dir, pos, model, data, g1, g2);
-  ASSERT_EQ(ncons, 1);
+  // normal points into the box
+  mjtNum xaxis[3] = {xmat2[0], xmat2[3], xmat2[6]};
+  EXPECT_LT(mju_dot3(dir1.data(), xaxis), -0.999);
 
-  EXPECT_MJTNUM_EQ(status1.x1[0], status2.x1[0]);
+  // multiccd: two contacts along the cylinder side
+  int ncons2 =
+      Penetration(status2, dist2, dir2, pos2, model, data, g1, g2, 0, 4);
+  ASSERT_EQ(ncons2, 2);
+  EXPECT_NEAR(dist2, dist1, kTolerance);
+  for (int i = 0; i < ncons2; i++) {
+    EXPECT_GT(mju_dot3(&dir2[3*i], dir1.data()), 0.999);
+  }
 }
 
 }  // namespace
@@ -2572,6 +2580,33 @@ TEST_F(MjGjkTest, MultiCCDEdgeClipEmpty) {
   EXPECT_MJTNUM_EQ(dir1[0], dir2[0]);
   EXPECT_MJTNUM_EQ(dir1[1], dir2[1]);
   EXPECT_MJTNUM_EQ(dir1[2], dir2[2]);
+}
+
+TEST_F(MjGjkTest, EpaCylinderThinBoxNormal) {
+  static constexpr char xml[] = R"(
+  <mujoco>
+    <worldbody>
+      <geom name="box" type="box" size="0.015 0.015 0.0025"/>
+      <geom name="cylinder" type="cylinder" size="0.006 0.08" pos="0.0127 -0.0788 0.008375"
+            quat="-0.1248 0.1248 -0.696 0.69601"/>
+    </worldbody>
+  </mujoco>)";
+
+  MjModelPtr model = LoadModelFromString(xml);
+  MjDataPtr data = MakeData(model);
+  mj_forward(model.get(), data.get());
+
+  int g1 = mj_name2id(model.get(), mjOBJ_GEOM, "cylinder");
+  int g2 = mj_name2id(model.get(), mjOBJ_GEOM, "box");
+
+  mjCCDStatus status;
+  std::vector<mjtNum> dir, pos;
+  mjtNum dist;
+  int ncons = Penetration(status, dist, dir, pos, model, data, g1, g2);
+
+  ASSERT_EQ(ncons, 1);
+  EXPECT_LT(dir[2], -0.999);
+  EXPECT_NEAR(dist, -1.2611e-4, kTolerance);
 }
 
 }  // namespace mujoco
